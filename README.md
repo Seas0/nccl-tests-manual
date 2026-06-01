@@ -28,7 +28,7 @@ This will generate test binaries with names such as `all_reduce_perf_mpi`.
 
 ## Usage
 
-NCCL tests can run on multiple processes, multiple threads, and multiple CUDA devices per thread. The number of process is managed by MPI and is therefore not passed to the tests as argument. The total number of ranks (=CUDA devices) will be equal to `(number of processes)*(number of threads)*(number of GPUs per thread)`.
+NCCL tests can run on multiple processes, multiple threads, and multiple CUDA devices per thread. With the standard launcher, the number of processes is managed by MPI and is therefore not passed to the tests as argument. With manual launch, the number of processes is provided through environment variables. The total number of ranks (=CUDA devices) will be equal to `(number of processes)*(number of threads)*(number of GPUs per thread)`.
 
 ### Quick examples
 
@@ -47,9 +47,7 @@ $ mpirun -np 64 -N 8 ./build/all_reduce_perf -b 8 -e 8G -f 2 -g 1
 ```
 
 Run manually across nodes without `mpirun`/SSH by starting one process on each
-node and using the built-in TCP rendezvous. Rank 0 listens on
-`NCCL_TESTS_MASTER_PORT`, waits for all other ranks, broadcasts the NCCL unique
-ID, and the benchmark barriers/allreduces use the same control connection.
+node and using the built-in TCP rendezvous:
 
 On node 0:
 
@@ -71,6 +69,39 @@ For multiple manually launched processes on the same node, set
 `NCCL_TESTS_LOCAL_RANK` per local process so GPU selection stays disjoint.
 Non-zero ranks retry the rendezvous connection for
 `NCCL_TESTS_CONNECT_RETRY_SEC` seconds, defaulting to 600.
+
+### Manual launch
+
+Manual launch is intended for environments where the test processes are started
+by an external scheduler or by hand, and MPI/SSH launch is not available. It can
+be used with binaries built with or without `MPI=1`. If an MPI-enabled binary is
+started with manual launch environment variables, the test skips `MPI_Init` and
+uses the manual control connection instead of MPI for setup barriers and
+cross-rank reductions.
+
+Set the following environment variables for each process:
+
+* `NCCL_TESTS_WORLD_SIZE`: total number of manually started processes. Required.
+* `NCCL_TESTS_RANK`: global process rank in `[0, NCCL_TESTS_WORLD_SIZE)`. Required.
+* `NCCL_TESTS_MASTER_ADDR`: rank 0 address or hostname for non-zero ranks to connect to. Defaults to `127.0.0.1`.
+* `NCCL_TESTS_MASTER_PORT`: TCP rendezvous port on rank 0. Defaults to `29500`.
+* `NCCL_TESTS_LOCAL_RANK`: local process index on the current host. Defaults to `0`; set it when running multiple processes per node so each process selects a different GPU range.
+* `NCCL_TESTS_CONNECT_RETRY_SEC`: non-zero rank connection retry window in seconds. Defaults to `600`.
+
+Rank 0 listens for all non-zero ranks, sends the NCCL unique ID, then waits at a
+startup barrier before the benchmark begins. The same TCP connections are also
+used for benchmark-level barriers and reductions needed for reporting. NCCL data
+traffic is still handled by NCCL itself; the manual TCP connection is only a
+control-plane rendezvous path.
+
+The rank 0 listener binds an IPv6 wildcard socket (`::`). Clients resolve
+`NCCL_TESTS_MASTER_ADDR` with IPv4 or IPv6 support. On IPv6-only clusters, pass a
+rank 0 IPv6 address or hostname. For link-local IPv6 addresses, include the zone
+suffix required by the OS, for example `fe80::1234%ib0`.
+
+Manual launch does not compute MPI host-local ranks and does not apply
+`NCCL_TESTS_SPLIT`/`NCCL_TESTS_SPLIT_MASK`; use MPI launch for those split-group
+workflows.
 
 ### Performance
 
@@ -98,7 +129,7 @@ All tests support the same set of arguments :
   * `-w,--warmup_iters <warmup iteration count>` number of warmup iterations (not timed). Default : 1.
   * `-m,--agg_iters <aggregation count>` number of operations to aggregate together in each iteration. Default : 1.
   * `-N,--run_cycles <cycle count>` run & print each cycle. Default : 1; 0=infinite.
-  * `-a,--average <0/1/2/3>` Report performance as an average across all ranks (MPI=1 only). <0=Rank0,1=Avg,2=Min,3=Max>. Default : 1.
+  * `-a,--average <0/1/2/3>` Report performance as an average across all ranks (MPI or manual multi-rank launch only). <0=Rank0,1=Avg,2=Min,3=Max>. Default : 1.
 * Test operation
   * `-p,--parallel_init <0/1>` use threads to initialize NCCL in parallel. Default : 0.
   * `-c,--check <check iteration count>` perform count iterations, checking correctness of results on each iteration. This can be quite slow on large numbers of GPUs. Default : 1.
