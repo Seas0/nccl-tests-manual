@@ -46,6 +46,32 @@ Scanning from 8 Bytes to 8GiB (Gibibytes), doubling between each test (`-f 2`).
 $ mpirun -np 64 -N 8 ./build/all_reduce_perf -b 8 -e 8G -f 2 -g 1
 ```
 
+Run manually across nodes without `mpirun`/SSH by starting one process on each
+node and using the built-in TCP rendezvous. Rank 0 listens on
+`NCCL_TESTS_MASTER_PORT`, waits for all other ranks, broadcasts the NCCL unique
+ID, and the benchmark barriers/allreduces use the same control connection.
+
+On node 0:
+
+```shell
+$ NCCL_TESTS_WORLD_SIZE=2 NCCL_TESTS_RANK=0 \
+  NCCL_TESTS_MASTER_ADDR=<node0-ip-or-hostname> NCCL_TESTS_MASTER_PORT=29500 \
+  ./build/all_reduce_perf -b 8 -e 8G -f 2 -g 8
+```
+
+On node 1:
+
+```shell
+$ NCCL_TESTS_WORLD_SIZE=2 NCCL_TESTS_RANK=1 \
+  NCCL_TESTS_MASTER_ADDR=<node0-ip-or-hostname> NCCL_TESTS_MASTER_PORT=29500 \
+  ./build/all_reduce_perf -b 8 -e 8G -f 2 -g 8
+```
+
+For multiple manually launched processes on the same node, set
+`NCCL_TESTS_LOCAL_RANK` per local process so GPU selection stays disjoint.
+Non-zero ranks retry the rendezvous connection for
+`NCCL_TESTS_CONNECT_RETRY_SEC` seconds, defaulting to 600.
+
 ### Performance
 
 See the [Performance](doc/PERFORMANCE.md) page for explanation about numbers, and in particular the "busbw" column.

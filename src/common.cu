@@ -13,8 +13,14 @@
 #include <libgen.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdlib.h>
 #include "cuda.h"
 #include <errno.h>     /* program_invocation_short_name */
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 
 #include "util.h"
 #include "../verifiable/verifiable.h"
@@ -116,6 +122,16 @@ static int ctaPolicy = -1;
 #endif
 static int minCudaArch = 1<<30;
 
+static int manualLaunch = 0;
+static int manualRank = 0;
+static int manualWorldSize = 1;
+static int manualLocalRank = 0;
+static const char* manualMasterAddr = nullptr;
+static int manualMasterPort = 29500;
+static int manualListenFd = -1;
+static int manualServerFd = -1;
+static int* manualPeerFds = nullptr;
+
 enum output_file_type_t {
   JSON_FILE_OUTPUT,
   UNSPECIFIED_FILE_OUTPUT
@@ -162,8 +178,16 @@ static output_file_type_t classifyOutputFile(const char *filename) {
   return UNSPECIFIED_FILE_OUTPUT;
 }
 
+static int parseEnvInt(const char* name, int* value);
+static int manualLaunchRequested();
+
 static void outputFileInit(output_file_type_t output_file_type,
                            const char *output_file, char argc, char **argv, char **envp) {
+  if (manualLaunchRequested()) {
+    int rank = 0;
+    if (parseEnvInt("NCCL_TESTS_RANK", &rank) <= 0 || rank != 0) return;
+  }
+
   switch (output_file_type) {
   case JSON_FILE_OUTPUT:
     jsonOutputInit(output_file, argc, argv, envp);
@@ -182,6 +206,275 @@ static void outputFileFinalize(output_file_type_t output_file_type) {
   case UNSPECIFIED_FILE_OUTPUT:
   default:
     break;
+  }
+}
+
+static int parseEnvInt(const char* name, int* value) {
+  const char* env = getenv(name);
+  if (env == nullptr || env[0] == '\0') return 0;
+  char* end = nullptr;
+  long parsed = strtol(env, &end, 0);
+  if (end == env || *end != '\0') {
+    fprintf(stderr, "Invalid integer value for %s: %s\n", name, env);
+    return -1;
+  }
+  *value = (int)parsed;
+  return 1;
+}
+
+static int manualLaunchRequested() {
+  return getenv("NCCL_TESTS_MANUAL") || getenv("NCCL_TESTS_RANK") || getenv("NCCL_TESTS_WORLD_SIZE");
+}
+
+static int manualReadExact(int fd, void* data, size_t size) {
+  char* ptr = (char*)data;
+  while (size > 0) {
+    ssize_t ret = recv(fd, ptr, size, MSG_WAITALL);
+    if (ret == 0) return -1;
+    if (ret < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    ptr += ret;
+    size -= ret;
+  }
+  return 0;
+}
+
+static int manualWriteExact(int fd, const void* data, size_t size) {
+  const char* ptr = (const char*)data;
+  while (size > 0) {
+    ssize_t ret = send(fd, ptr, size, 0);
+    if (ret == 0) return -1;
+    if (ret < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    ptr += ret;
+    size -= ret;
+  }
+  return 0;
+}
+
+static int manualListen(int port) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+
+  int one = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons(port);
+  if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+    close(fd);
+    return -1;
+  }
+  if (listen(fd, manualWorldSize) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static int manualConnect(const char* host, int port) {
+  char portStr[32];
+  snprintf(portStr, sizeof(portStr), "%d", port);
+
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+
+  struct addrinfo* result = nullptr;
+  int gai = getaddrinfo(host, portStr, &hints, &result);
+  if (gai != 0) {
+    fprintf(stderr, "Could not resolve NCCL_TESTS_MASTER_ADDR=%s: %s\n", host, gai_strerror(gai));
+    return -1;
+  }
+
+  int retrySec = 600;
+  parseEnvInt("NCCL_TESTS_CONNECT_RETRY_SEC", &retrySec);
+  for (int sec = 0; sec <= retrySec; sec++) {
+    for (struct addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
+      int fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+      if (fd < 0) continue;
+      if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+        freeaddrinfo(result);
+        return fd;
+      }
+      close(fd);
+    }
+    if (sec < retrySec) sleep(1);
+  }
+
+  freeaddrinfo(result);
+  return -1;
+}
+
+static testResult_t manualInitConfig(int* totalProcs, int* proc, int* ncclProcs, int* ncclProc, int* localRank) {
+  if (!manualLaunchRequested()) return testSuccess;
+
+  manualLaunch = 1;
+  int ret = parseEnvInt("NCCL_TESTS_WORLD_SIZE", &manualWorldSize);
+  if (ret <= 0) {
+    fprintf(stderr, "Manual launch requires NCCL_TESTS_WORLD_SIZE\n");
+    return testInvalidUsage;
+  }
+  ret = parseEnvInt("NCCL_TESTS_RANK", &manualRank);
+  if (ret <= 0) {
+    fprintf(stderr, "Manual launch requires NCCL_TESTS_RANK\n");
+    return testInvalidUsage;
+  }
+  if (parseEnvInt("NCCL_TESTS_LOCAL_RANK", &manualLocalRank) < 0) return testInvalidUsage;
+  if (parseEnvInt("NCCL_TESTS_MASTER_PORT", &manualMasterPort) < 0) return testInvalidUsage;
+  manualMasterAddr = getenv("NCCL_TESTS_MASTER_ADDR");
+  if (manualMasterAddr == nullptr || manualMasterAddr[0] == '\0') manualMasterAddr = "127.0.0.1";
+
+  if (manualWorldSize < 1 || manualRank < 0 || manualRank >= manualWorldSize) {
+    fprintf(stderr, "Invalid manual launch rank/world size: rank=%d world_size=%d\n", manualRank, manualWorldSize);
+    return testInvalidUsage;
+  }
+
+  *totalProcs = manualWorldSize;
+  *proc = manualRank;
+  *ncclProcs = manualWorldSize;
+  *ncclProc = manualRank;
+  *localRank = manualLocalRank;
+  return testSuccess;
+}
+
+static testResult_t manualBootstrap(ncclUniqueId* ncclId) {
+  if (!manualLaunch || manualWorldSize == 1) return testSuccess;
+
+  if (manualRank == 0) {
+    manualPeerFds = (int*)malloc(sizeof(int)*manualWorldSize);
+    if (manualPeerFds == nullptr) return testInternalError;
+    for (int r = 0; r < manualWorldSize; r++) manualPeerFds[r] = -1;
+
+    manualListenFd = manualListen(manualMasterPort);
+    if (manualListenFd < 0) {
+      fprintf(stderr, "Could not listen on NCCL_TESTS_MASTER_PORT=%d: %s\n", manualMasterPort, strerror(errno));
+      return testInvalidUsage;
+    }
+    fprintf(stderr, "# Manual launch rank 0 waiting for %d peers on port %d\n", manualWorldSize-1, manualMasterPort);
+
+    for (int connected = 1; connected < manualWorldSize; connected++) {
+      int fd = accept(manualListenFd, nullptr, nullptr);
+      if (fd < 0) {
+        if (errno == EINTR) {
+          connected--;
+          continue;
+        }
+        fprintf(stderr, "Manual launch accept failed: %s\n", strerror(errno));
+        return testInvalidUsage;
+      }
+      uint32_t rankNet;
+      if (manualReadExact(fd, &rankNet, sizeof(rankNet)) != 0) {
+        fprintf(stderr, "Manual launch failed to read peer rank\n");
+        close(fd);
+        return testInvalidUsage;
+      }
+      int rank = (int)ntohl(rankNet);
+      if (rank <= 0 || rank >= manualWorldSize || manualPeerFds[rank] != -1) {
+        fprintf(stderr, "Manual launch received invalid or duplicate rank %d\n", rank);
+        close(fd);
+        return testInvalidUsage;
+      }
+      manualPeerFds[rank] = fd;
+    }
+
+    for (int rank = 1; rank < manualWorldSize; rank++) {
+      if (manualWriteExact(manualPeerFds[rank], ncclId, sizeof(*ncclId)) != 0) {
+        fprintf(stderr, "Manual launch failed to send NCCL unique ID to rank %d\n", rank);
+        return testInvalidUsage;
+      }
+    }
+  } else {
+    manualServerFd = manualConnect(manualMasterAddr, manualMasterPort);
+    if (manualServerFd < 0) {
+      fprintf(stderr, "Could not connect to manual launch master %s:%d\n", manualMasterAddr, manualMasterPort);
+      return testInvalidUsage;
+    }
+    uint32_t rankNet = htonl((uint32_t)manualRank);
+    if (manualWriteExact(manualServerFd, &rankNet, sizeof(rankNet)) != 0 ||
+        manualReadExact(manualServerFd, ncclId, sizeof(*ncclId)) != 0) {
+      fprintf(stderr, "Manual launch failed during NCCL unique ID exchange\n");
+      return testInvalidUsage;
+    }
+  }
+  return testSuccess;
+}
+
+static testResult_t manualBarrier() {
+  if (!manualLaunch || manualWorldSize == 1) return testSuccess;
+
+  char byte = 1;
+  if (manualRank == 0) {
+    for (int rank = 1; rank < manualWorldSize; rank++) {
+      if (manualReadExact(manualPeerFds[rank], &byte, 1) != 0) return testInvalidUsage;
+    }
+    for (int rank = 1; rank < manualWorldSize; rank++) {
+      if (manualWriteExact(manualPeerFds[rank], &byte, 1) != 0) return testInvalidUsage;
+    }
+  } else {
+    if (manualWriteExact(manualServerFd, &byte, 1) != 0 ||
+        manualReadExact(manualServerFd, &byte, 1) != 0) return testInvalidUsage;
+  }
+  return testSuccess;
+}
+
+template<typename T>
+static testResult_t manualAllreduceValue(T* value, int average) {
+  if (!manualLaunch || manualWorldSize == 1 || average == 0) return testSuccess;
+
+  T result = *value;
+  if (manualRank == 0) {
+    for (int rank = 1; rank < manualWorldSize; rank++) {
+      T peer;
+      if (manualReadExact(manualPeerFds[rank], &peer, sizeof(peer)) != 0) return testInvalidUsage;
+      switch(average) {
+      case /*avg*/1:
+      case /*sum*/4:
+        result += peer;
+        break;
+      case /*min*/2:
+        result = std::min<T>(result, peer);
+        break;
+      case /*max*/3:
+        result = std::max<T>(result, peer);
+        break;
+      }
+    }
+    for (int rank = 1; rank < manualWorldSize; rank++) {
+      if (manualWriteExact(manualPeerFds[rank], &result, sizeof(result)) != 0) return testInvalidUsage;
+    }
+  } else {
+    if (manualWriteExact(manualServerFd, value, sizeof(*value)) != 0 ||
+        manualReadExact(manualServerFd, &result, sizeof(result)) != 0) return testInvalidUsage;
+  }
+
+  *value = result;
+  return testSuccess;
+}
+
+static void manualFinalize() {
+  if (manualPeerFds) {
+    for (int rank = 1; rank < manualWorldSize; rank++) {
+      if (manualPeerFds[rank] != -1) close(manualPeerFds[rank]);
+    }
+    free(manualPeerFds);
+    manualPeerFds = nullptr;
+  }
+  if (manualServerFd != -1) {
+    close(manualServerFd);
+    manualServerFd = -1;
+  }
+  if (manualListenFd != -1) {
+    close(manualListenFd);
+    manualListenFd = -1;
   }
 }
 
@@ -280,8 +573,12 @@ void Barrier(struct threadArgs *args) {
     while(counter[epoch] != args->nThreads)
       pthread_cond_wait(&cond[epoch], &lock[epoch]);
     #ifdef MPI_SUPPORT
-      MPI_Barrier(MPI_COMM_WORLD);
+      if (!manualLaunch) MPI_Barrier(MPI_COMM_WORLD);
     #endif
+    if (manualBarrier() != testSuccess) {
+      fprintf(stderr, "Manual launch barrier failed\n");
+      exit(1);
+    }
     counter[epoch] = 0;
     pthread_cond_broadcast(&cond[epoch]);
   }
@@ -325,7 +622,7 @@ void Allreduce(struct threadArgs* args, T* value, int average) {
       pthread_cond_wait(&cond[epoch], &lock[epoch]);
 
     #ifdef MPI_SUPPORT
-    if(average != 0) {
+    if(!manualLaunch && average != 0) {
       static_assert(std::is_same<T, long long>::value || std::is_same<T, double>::value, "Allreduce<T> only for T in {long long, double}");
       MPI_Datatype ty = std::is_same<T, long long>::value ? MPI_LONG_LONG :
                         std::is_same<T, double>::value ? MPI_DOUBLE :
@@ -337,6 +634,10 @@ void Allreduce(struct threadArgs* args, T* value, int average) {
       MPI_Allreduce(MPI_IN_PLACE, (void*)&accumulator[epoch], 1, ty, op, MPI_COMM_WORLD);
     }
     #endif
+    if (manualAllreduceValue(&accumulator[epoch], average) != testSuccess) {
+      fprintf(stderr, "Manual launch allreduce failed\n");
+      exit(1);
+    }
 
     if(average == 1) accumulator[epoch] /= args->totalProcs*args->nThreads;
     counter[epoch] = 0;
@@ -1200,7 +1501,7 @@ int main(int argc, char* argv[], char **envp) {
   }
 
 #ifdef MPI_SUPPORT
-  MPI_Init(&argc, &argv);
+  if (!manualLaunchRequested()) MPI_Init(&argc, &argv);
 #endif
 
   const output_file_type_t output_file_type = classifyOutputFile(output_file);
@@ -1245,58 +1546,75 @@ testResult_t run() {
   int localRank = 0;
   char hostname[1024];
   getHostName(hostname, 1024);
+  TESTCHECK(manualInitConfig(&totalProcs, &proc, &ncclProcs, &ncclProc, &localRank));
 
 #ifdef MPI_SUPPORT
-  MPI_Comm_size(MPI_COMM_WORLD, &totalProcs);
-  MPI_Comm_rank(MPI_COMM_WORLD, &proc);
-  uint64_t hostHashs[totalProcs];
-  hostHashs[proc] = getHostHash(hostname);
-  MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, hostHashs, sizeof(uint64_t), MPI_BYTE, MPI_COMM_WORLD);
-  for (int p=0; p<totalProcs; p++) {
-    if (p == proc) break;
-    if (hostHashs[p] == hostHashs[proc]) localRank++;
-  }
-
-  char *splitMaskEnv = NULL;
-  if (splitMaskEnv = getenv("NCCL_TESTS_SPLIT_MASK")) {
-    color = proc & strtoul(splitMaskEnv, NULL, 16);
-  } else if (splitMaskEnv = getenv("NCCL_TESTS_SPLIT")) {
-    if (
-      (strncasecmp(splitMaskEnv, "AND", strlen("AND")) == 0 && parseInt(splitMaskEnv + strlen("AND"), &color)) ||
-      (strncasecmp(splitMaskEnv, "&", strlen("&")) == 0 && parseInt(splitMaskEnv + strlen("&"), &color))
-    )
-        color = proc & color;
-    if (
-      (strncasecmp(splitMaskEnv, "OR", strlen("OR")) == 0 && parseInt(splitMaskEnv + strlen("OR"), &color)) ||
-      (strncasecmp(splitMaskEnv, "|", strlen("|")) == 0 && parseInt(splitMaskEnv + strlen("|"), &color))
-    )
-        color = proc | color;
-    if (
-      (strncasecmp(splitMaskEnv, "MOD", strlen("MOD")) == 0 && parseInt(splitMaskEnv + strlen("MOD"), &color)) ||
-      (strncasecmp(splitMaskEnv, "%", strlen("%")) == 0 && parseInt(splitMaskEnv + strlen("%"), &color))
-    )
-        color = proc % color;
-    if (
-      (strncasecmp(splitMaskEnv, "DIV", strlen("DIV")) == 0 && parseInt(splitMaskEnv + strlen("DIV"), &color)) ||
-      (strncasecmp(splitMaskEnv, "/", strlen("/")) == 0 && parseInt(splitMaskEnv + strlen("/"), &color))
-    )
-        color = proc / color;
-  }
-
   MPI_Comm mpi_comm;
-  MPI_Comm_split(MPI_COMM_WORLD, color, proc, &mpi_comm);
-  MPI_Comm_size(mpi_comm, &ncclProcs);
-  MPI_Comm_rank(mpi_comm, &ncclProc);
+  if (!manualLaunch) {
+    MPI_Comm_size(MPI_COMM_WORLD, &totalProcs);
+    MPI_Comm_rank(MPI_COMM_WORLD, &proc);
+    uint64_t hostHashs[totalProcs];
+    hostHashs[proc] = getHostHash(hostname);
+    MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, hostHashs, sizeof(uint64_t), MPI_BYTE, MPI_COMM_WORLD);
+    for (int p=0; p<totalProcs; p++) {
+      if (p == proc) break;
+      if (hostHashs[p] == hostHashs[proc]) localRank++;
+    }
+
+    char *splitMaskEnv = NULL;
+    if (splitMaskEnv = getenv("NCCL_TESTS_SPLIT_MASK")) {
+      color = proc & strtoul(splitMaskEnv, NULL, 16);
+    } else if (splitMaskEnv = getenv("NCCL_TESTS_SPLIT")) {
+      if (
+        (strncasecmp(splitMaskEnv, "AND", strlen("AND")) == 0 && parseInt(splitMaskEnv + strlen("AND"), &color)) ||
+        (strncasecmp(splitMaskEnv, "&", strlen("&")) == 0 && parseInt(splitMaskEnv + strlen("&"), &color))
+      )
+          color = proc & color;
+      if (
+        (strncasecmp(splitMaskEnv, "OR", strlen("OR")) == 0 && parseInt(splitMaskEnv + strlen("OR"), &color)) ||
+        (strncasecmp(splitMaskEnv, "|", strlen("|")) == 0 && parseInt(splitMaskEnv + strlen("|"), &color))
+      )
+          color = proc | color;
+      if (
+        (strncasecmp(splitMaskEnv, "MOD", strlen("MOD")) == 0 && parseInt(splitMaskEnv + strlen("MOD"), &color)) ||
+        (strncasecmp(splitMaskEnv, "%", strlen("%")) == 0 && parseInt(splitMaskEnv + strlen("%"), &color))
+      )
+          color = proc % color;
+      if (
+        (strncasecmp(splitMaskEnv, "DIV", strlen("DIV")) == 0 && parseInt(splitMaskEnv + strlen("DIV"), &color)) ||
+        (strncasecmp(splitMaskEnv, "/", strlen("/")) == 0 && parseInt(splitMaskEnv + strlen("/"), &color))
+      )
+          color = proc / color;
+    }
+
+    MPI_Comm_split(MPI_COMM_WORLD, color, proc, &mpi_comm);
+    MPI_Comm_size(mpi_comm, &ncclProcs);
+    MPI_Comm_rank(mpi_comm, &ncclProc);
+  }
 #endif
   is_main_thread = is_main_proc = (proc == 0) ? 1 : 0;
 
   jsonIdentifyWriter(is_main_thread);
+
+  ncclUniqueId ncclId;
+  if (ncclProc == 0) {
+    NCCLCHECK(ncclGetUniqueId(&ncclId));
+  }
+#ifdef MPI_SUPPORT
+  if (!manualLaunch) {
+    MPI_Bcast(&ncclId, sizeof(ncclId), MPI_BYTE, 0, mpi_comm);
+    MPI_Barrier(MPI_COMM_WORLD); // Ensure Bcast is complete for HCOLL
+  }
+#endif
+  TESTCHECK(manualBootstrap(&ncclId));
+  TESTCHECK(manualBarrier());
 
   size_t maxMem = ~0;
   testResult_t report_result = writeDeviceReport(&maxMem, localRank, proc, totalProcs, color, hostname, program_invocation_short_name);
   if(report_result != testSuccess) {
     return report_result;
   }
+  TESTCHECK(manualAllreduceValue(&maxMem, /*min*/2));
 
   // Reserve 1GiB of memory for each 16GiB installed, but limit to a max of 4GiB
   const size_t GB = (1ULL << 30);
@@ -1309,14 +1627,6 @@ testResult_t run() {
     if (proc == 0) printf("#\n# Reducing maxBytes to %ld due to memory limitation\n", maxBytes);
   }
 
-  ncclUniqueId ncclId;
-  if (ncclProc == 0) {
-    NCCLCHECK(ncclGetUniqueId(&ncclId));
-  }
-#ifdef MPI_SUPPORT
-  MPI_Bcast(&ncclId, sizeof(ncclId), MPI_BYTE, 0, mpi_comm);
-  MPI_Barrier(MPI_COMM_WORLD); // Ensure Bcast is complete for HCOLL
-#endif
   int gpus[nGpus*nThreads];
   cudaStream_t streams[nGpus*nThreads];
   void* sendbuffs[nGpus*nThreads];
@@ -1344,8 +1654,9 @@ testResult_t run() {
   }
 
 #ifdef MPI_SUPPORT
-  MPI_Allreduce(MPI_IN_PLACE, &minCudaArch, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  if (!manualLaunch) MPI_Allreduce(MPI_IN_PLACE, &minCudaArch, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
 #endif
+  TESTCHECK(manualAllreduceValue(&minCudaArch, /*min*/2));
 #if defined(__CUDA_FP8_TYPES_EXIST__)
   if (NCCL_VERSION_CODE >= NCCL_VERSION(2,24,0) && test_ncclVersion >= NCCL_VERSION(2,24,0)) {
     if (minCudaArch < 900) { // Filter out fp8 on pre-Hopper hardware
@@ -1554,11 +1865,17 @@ testResult_t run() {
   }
 
 #ifdef MPI_SUPPORT
-  MPI_Allreduce(MPI_IN_PLACE, &errors[0], 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, &devMemUsed[0], 1, MPI_INT64_T, MPI_MAX, MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, &initGpuMem[0], 1, MPI_INT64_T, MPI_MAX, MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, &bufferMemory[0], 1, MPI_INT64_T, MPI_MAX, MPI_COMM_WORLD);
+  if (!manualLaunch) {
+    MPI_Allreduce(MPI_IN_PLACE, &errors[0], 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &devMemUsed[0], 1, MPI_INT64_T, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &initGpuMem[0], 1, MPI_INT64_T, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &bufferMemory[0], 1, MPI_INT64_T, MPI_MAX, MPI_COMM_WORLD);
+  }
 #endif
+  TESTCHECK(manualAllreduceValue(&errors[0], /*sum*/4));
+  TESTCHECK(manualAllreduceValue(&devMemUsed[0], /*max*/3));
+  TESTCHECK(manualAllreduceValue(&initGpuMem[0], /*max*/3));
+  TESTCHECK(manualAllreduceValue(&bufferMemory[0], /*max*/3));
 
   if (!parallel_init) {
     for(int i=0; i<nGpus*nThreads; ++i) {
@@ -1607,9 +1924,12 @@ testResult_t run() {
   finalizeFooter();
 
 #ifdef MPI_SUPPORT
-  MPI_Comm_free(&mpi_comm);
-  MPI_Finalize();
+  if (!manualLaunch) {
+    MPI_Comm_free(&mpi_comm);
+    MPI_Finalize();
+  }
 #endif
+  manualFinalize();
 
   writeErrors();
 

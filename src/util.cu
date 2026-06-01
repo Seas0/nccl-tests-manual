@@ -19,6 +19,7 @@
 #include "util.h"
 #include <assert.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <string>
 #include <iomanip>
 
@@ -297,8 +298,13 @@ void jsonOutputInit(const char *in_path,
   }
 
   #ifdef MPI_SUPPORT
-  int proc;
-  MPI_Comm_rank(MPI_COMM_WORLD, &proc);
+  int proc = 0;
+  if (getenv("NCCL_TESTS_MANUAL") || getenv("NCCL_TESTS_RANK") || getenv("NCCL_TESTS_WORLD_SIZE")) {
+    const char* rankEnv = getenv("NCCL_TESTS_RANK");
+    proc = rankEnv ? atoi(rankEnv) : 0;
+  } else {
+    MPI_Comm_rank(MPI_COMM_WORLD, &proc);
+  }
   if(proc != 0) {
     return;
   }
@@ -577,29 +583,32 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   }
 
 #if MPI_SUPPORT
-  char *lines = (proc == 0) ? (char *)malloc(totalProcs*MAX_LINE) : NULL;
-  // Gather all output in rank order to root (0)
-  MPI_Gather(line, MAX_LINE, MPI_BYTE, lines, MAX_LINE, MPI_BYTE, 0, MPI_COMM_WORLD);
-  if (proc == 0) {
-    if(write_json) {
-      jsonKey("devices");
-      jsonStartList();
-    }
-    for (int p = 0; p < totalProcs; p++) {
-      PRINT("%s", lines+MAX_LINE*p);
+  if (!(getenv("NCCL_TESTS_MANUAL") || getenv("NCCL_TESTS_RANK") || getenv("NCCL_TESTS_WORLD_SIZE"))) {
+    char *lines = (proc == 0) ? (char *)malloc(totalProcs*MAX_LINE) : NULL;
+    // Gather all output in rank order to root (0)
+    MPI_Gather(line, MAX_LINE, MPI_BYTE, lines, MAX_LINE, MPI_BYTE, 0, MPI_COMM_WORLD);
+    if (proc == 0) {
       if(write_json) {
-        rankInfo_t rankinfo;
-        parseRankInfo(&rankinfo, lines + MAX_LINE*p);
-        jsonRankInfo(&rankinfo);
+        jsonKey("devices");
+        jsonStartList();
       }
+      for (int p = 0; p < totalProcs; p++) {
+        PRINT("%s", lines+MAX_LINE*p);
+        if(write_json) {
+          rankInfo_t rankinfo;
+          parseRankInfo(&rankinfo, lines + MAX_LINE*p);
+          jsonRankInfo(&rankinfo);
+        }
+      }
+      if(write_json) {
+        jsonFinishList();
+      }
+      free(lines);
     }
-    if(write_json) {
-      jsonFinishList();
-    }
-    free(lines);
-  }
-  MPI_Allreduce(MPI_IN_PLACE, maxMem, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
-#else
+    MPI_Allreduce(MPI_IN_PLACE, maxMem, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
+  } else
+#endif
+  {
   PRINT("%s", line);
   if(write_json) {
     rankInfo_t rankinfo;
@@ -609,7 +618,7 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     jsonRankInfo(&rankinfo);
     jsonFinishList();
   }
-#endif
+  }
   if(write_json) {
     jsonFinishObject();
   }
